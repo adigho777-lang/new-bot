@@ -91,6 +91,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/genkey [count] - Generate key(s) instantly\n"
             "/deletekey KEY - Delete a key\n"
             "/listkeys - List recent keys\n"
+            "/keyinfo KEY - Key details + who used it\n"
             "/listusers - List users\n"
             "/ban UID - Ban user\n"
             "/unban UID - Unban user\n"
@@ -194,7 +195,46 @@ async def deletekey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Key {key} deleted.")
 
 # ── /listkeys ─────────────────────────────────────────────
-async def listkeys(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def keyinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Not authorized.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /keyinfo KEY")
+        return
+    key = ctx.args[0].upper()
+    snap = db.collection("keys").document(key).get()
+    if not snap.exists:
+        await update.message.reply_text("Key not found.")
+        return
+    d = snap.to_dict()
+    now_ms = int(time.time() * 1000)
+    created = datetime.fromtimestamp(d["createdAt"] / 1000).strftime("%d %b %Y %H:%M")
+    expires = datetime.fromtimestamp(d["expiresAt"] / 1000).strftime("%d %b %Y %H:%M")
+
+    if d.get("used"):
+        used_by = d.get("usedBy", "unknown")
+        try:
+            user_snap = db.collection("users").document(used_by).get()
+            ud = user_snap.to_dict() if user_snap.exists else {}
+            name  = ud.get("name", "Unknown")
+            email = ud.get("email", "N/A")
+        except Exception:
+            name, email = "Unknown", "N/A"
+        status = f"Used\nUsed by: {name}\nEmail: {email}\nUID: {used_by}"
+    elif now_ms > d.get("expiresAt", 0):
+        status = "Expired"
+    else:
+        status = "Available"
+
+    await update.message.reply_text(
+        f"Key: {key}\n"
+        f"Status: {status}\n"
+        f"Created: {created}\n"
+        f"Expires: {expires}"
+    )
+
+
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Not authorized.")
         return
@@ -206,9 +246,19 @@ async def listkeys(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
     for s in snaps:
         d = s.to_dict()
-        if d.get("used"):                    status = "Used"
-        elif now_ms > d.get("expiresAt", 0): status = "Expired"
-        else:                                status = "Available"
+        if d.get("used"):
+            used_by = d.get("usedBy", "unknown")
+            # Try to get user name from Firestore
+            try:
+                user_snap = db.collection("users").document(used_by).get()
+                name = user_snap.to_dict().get("name", used_by[:8]) if user_snap.exists else used_by[:8]
+            except Exception:
+                name = used_by[:8]
+            status = f"Used by {name}"
+        elif now_ms > d.get("expiresAt", 0):
+            status = "Expired"
+        else:
+            status = "Available"
         lines.append(f"{s.id} - {status}")
     await update.message.reply_text("Recent Keys (last 20)\n\n" + "\n".join(lines))
 
@@ -291,6 +341,7 @@ def main():
     app.add_handler(CommandHandler("genkey",    genkey))
     app.add_handler(CommandHandler("deletekey", deletekey))
     app.add_handler(CommandHandler("listkeys",  listkeys))
+    app.add_handler(CommandHandler("keyinfo",   keyinfo))
     app.add_handler(CommandHandler("mykey",     mykey))
     app.add_handler(CommandHandler("listusers", listusers))
     app.add_handler(CommandHandler("ban",       ban))
