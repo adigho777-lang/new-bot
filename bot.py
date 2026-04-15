@@ -55,9 +55,25 @@ def save_key(key: str, created_by: int) -> int:
     })
     return expires_at
 
+def get_key_status(d: dict, now_ms: int) -> str:
+    if d.get("used"):
+        return "Used"
+    if now_ms > d.get("expiresAt", 0):
+        return "Expired"
+    return "Available"
+
+def get_user_name(uid: str) -> str:
+    try:
+        snap = db.collection("users").document(uid).get()
+        if snap.exists:
+            return snap.to_dict().get("name", uid[:8])
+    except Exception:
+        pass
+    return uid[:8]
+
 async def send_key(message, key: str, expires_at: int):
     expires_str = datetime.fromtimestamp(expires_at / 1000).strftime("%d %b %Y %H:%M")
-    keyboard = [[InlineKeyboardButton("🔄 Generate New Key", callback_data="new_key")]]
+    keyboard = [[InlineKeyboardButton("Generate New Key", callback_data="new_key")]]
     await message.reply_text(
         f"Your Access Key\n\n"
         f"{key}\n\n"
@@ -68,9 +84,8 @@ async def send_key(message, key: str, expires_at: int):
     )
 
 def join_keyboard():
-    channel_username = CHANNEL_ID.lstrip("@")
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Join Channel", url=f"https://t.me/{channel_username}"),
+        InlineKeyboardButton("Join Channel", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}"),
         InlineKeyboardButton("I Joined", callback_data="check_join"),
     ]])
 
@@ -90,8 +105,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "\nAdmin Commands:\n"
             "/genkey [count] - Generate key(s) instantly\n"
             "/deletekey KEY - Delete a key\n"
-            "/listkeys - List recent keys\n"
-            "/keyinfo KEY - Key details + who used it\n"
+            "/listkeys - List recent keys with status\n"
+            "/keyinfo KEY - Full key details\n"
             "/listusers - List users\n"
             "/ban UID - Ban user\n"
             "/unban UID - Unban user\n"
@@ -102,8 +117,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /getkey — everyone, requires channel join ─────────────
 async def getkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    joined = await is_member(ctx.bot, user.id)
-    if not joined:
+    if not await is_member(ctx.bot, user.id):
         await update.message.reply_text(
             f"Join our channel first to get a key!\n\n{CHANNEL_ID}\n\nAfter joining tap I Joined.",
             reply_markup=join_keyboard()
@@ -120,8 +134,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
 
     if query.data == "check_join":
-        joined = await is_member(ctx.bot, user.id)
-        if not joined:
+        if not await is_member(ctx.bot, user.id):
             await query.message.reply_text(
                 f"Still not joined!\nPlease join {CHANNEL_ID} and try again.",
                 reply_markup=join_keyboard()
@@ -132,9 +145,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_key(query.message, key, expires_at)
 
     elif query.data == "new_key":
-        # Check channel membership again before generating new key
-        joined = await is_member(ctx.bot, user.id)
-        if not joined:
+        if not await is_member(ctx.bot, user.id):
             await query.message.reply_text(
                 f"Join our channel first!\n{CHANNEL_ID}",
                 reply_markup=join_keyboard()
@@ -149,18 +160,15 @@ async def genkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Not authorized.")
         return
-
     count = 1
     if ctx.args:
         try:
             count = min(int(ctx.args[0]), 50)
         except ValueError:
             pass
-
     expires_at = int((datetime.now() + timedelta(hours=KEY_EXPIRY_HOURS)).timestamp() * 1000)
     batch = db.batch()
     keys = []
-
     for _ in range(count):
         key = gen_key()
         batch.set(db.collection("keys").document(key), {
@@ -171,12 +179,10 @@ async def genkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "createdBy": update.effective_user.id,
         })
         keys.append(key)
-
     batch.commit()
     expires_str = datetime.fromtimestamp(expires_at / 1000).strftime("%d %b %Y %H:%M")
-    key_text = "\n".join(keys)
     await update.message.reply_text(
-        f"{count} Key(s) Generated\n\n{key_text}\n\nExpires: {expires_str}"
+        f"{count} Key(s) Generated\n\n" + "\n".join(keys) + f"\n\nExpires: {expires_str}"
     )
 
 # ── /deletekey <key> ──────────────────────────────────────
@@ -195,6 +201,29 @@ async def deletekey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Key {key} deleted.")
 
 # ── /listkeys ─────────────────────────────────────────────
+async def listkeys(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Not authorized.")
+        return
+    snaps = db.collection("keys").order_by("createdAt", direction=firestore.Query.DESCENDING).limit(20).get()
+    if not snaps:
+        await update.message.reply_text("No keys found.")
+        return
+    now_ms = int(time.time() * 1000)
+    lines = []
+    for s in snaps:
+        d = s.to_dict()
+        if d.get("used"):
+            name = get_user_name(d.get("usedBy", ""))
+            status = f"Used by {name}"
+        elif now_ms > d.get("expiresAt", 0):
+            status = "Expired"
+        else:
+            status = "Available"
+        lines.append(f"{s.id} - {status}")
+    await update.message.reply_text("Recent Keys (last 20)\n\n" + "\n".join(lines))
+
+# ── /keyinfo <key> ────────────────────────────────────────
 async def keyinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Not authorized.")
@@ -228,44 +257,15 @@ async def keyinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         status = "Available"
 
     await update.message.reply_text(
-        f"Key: {key}\n"
-        f"Status: {status}\n"
-        f"Created: {created}\n"
-        f"Expires: {expires}"
+        f"Key: {key}\nStatus: {status}\nCreated: {created}\nExpires: {expires}"
     )
-
-
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Not authorized.")
-        return
-    snaps = db.collection("keys").order_by("createdAt", direction=firestore.Query.DESCENDING).limit(20).get()
-    if not snaps:
-        await update.message.reply_text("No keys found.")
-        return
-    now_ms = int(time.time() * 1000)
-    lines = []
-    for s in snaps:
-        d = s.to_dict()
-        if d.get("used"):
-            used_by = d.get("usedBy", "unknown")
-            # Try to get user name from Firestore
-            try:
-                user_snap = db.collection("users").document(used_by).get()
-                name = user_snap.to_dict().get("name", used_by[:8]) if user_snap.exists else used_by[:8]
-            except Exception:
-                name = used_by[:8]
-            status = f"Used by {name}"
-        elif now_ms > d.get("expiresAt", 0):
-            status = "Expired"
-        else:
-            status = "Available"
-        lines.append(f"{s.id} - {status}")
-    await update.message.reply_text("Recent Keys (last 20)\n\n" + "\n".join(lines))
 
 # ── /mykey ────────────────────────────────────────────────
 async def mykey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    users = db.collection("users").where(filter=firestore.FieldFilter("telegramId", "==", tg_id)).limit(1).get()
+    users = db.collection("users").where(
+        filter=firestore.FieldFilter("telegramId", "==", tg_id)
+    ).limit(1).get()
     if not users:
         await update.message.reply_text("Account not linked. Login in the app first.")
         return
@@ -292,8 +292,8 @@ async def listusers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
     for s in snaps:
         d = s.to_dict()
-        icon = "Banned" if d.get("blocked") else "Active"
-        lines.append(f"{icon} - {d.get('name', 'Unknown')} ({s.id[:10]}...)")
+        status = "Banned" if d.get("blocked") else "Active"
+        lines.append(f"{status} - {d.get('name', 'Unknown')} ({s.id[:10]}...)")
     await update.message.reply_text("Users (last 20)\n\n" + "\n".join(lines))
 
 # ── /ban + /unban ─────────────────────────────────────────
